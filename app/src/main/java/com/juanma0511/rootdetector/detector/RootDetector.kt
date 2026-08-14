@@ -922,6 +922,17 @@ class RootDetector(private val context: Context) {
         )
     }
 
+    // On Android 17+ Pixel builds the system partition is a shared/generic
+    // image, so ro.system.build.fingerprint legitimately reads as e.g.
+    // google/generic_system_google/generic:... while ro.build.fingerprint
+    // keeps the real device codename (blazer, tokay, ...). Not a spoof.
+    private fun isGenericSystemImage(parts: FingerprintParts): Boolean {
+        val product = parts.product.lowercase()
+        val device = parts.device.lowercase()
+        return product == "generic" || product.startsWith("generic_") ||
+            device == "generic" || device.startsWith("generic_")
+    }
+
     private fun compatibleIncremental(left: String, right: String): Boolean {
         if (left == right) return true
         if (left.startsWith(right) || right.startsWith(left)) return true
@@ -970,7 +981,10 @@ class RootDetector(private val context: Context) {
             return "ro.build and ro.system fingerprints disagree on build incremental"
         }
 
-        if (!trustedLocked && build.product != system.product && build.device != system.device) {
+        // Skip the codename comparison when one side is a generic/shared system
+        // image, otherwise every stock A17+ Pixel trips the product/device check.
+        if (!trustedLocked && !isGenericSystemImage(build) && !isGenericSystemImage(system) &&
+            build.product != system.product && build.device != system.device) {
             return "ro.build and ro.system fingerprints disagree on product/device"
         }
 
