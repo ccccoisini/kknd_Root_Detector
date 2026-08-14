@@ -9,6 +9,7 @@ import org.jetbrains.kotlin.gradle.dsl.JvmTarget
 android {
     namespace = "com.juanma0511.rootdetector"
     compileSdk = 36
+    ndkVersion = "28.0.12433566"
 
     defaultConfig {
         applicationId = "com.juanma0511.rootdetector"

@@ -520,14 +520,42 @@ class RootDetector(private val context: Context) {
 
     private fun checkNativeLibMaps(): List<DetectionItem> {
         val found = linkedSetOf<String>()
+        val trustedLocked = bootLooksLockedAndNormal()
         val systemPaths = protectedSystemPaths.map { "$it/" } + "/apex/"
-        val keywords = frameworkKeywords()
+        // Use the stricter strong-signal keyword set as the primary filter to avoid
+        // false positives from app-private JNI libs whose paths happen to contain a
+        // generic root-framework term (e.g. a vendor lib named "hook_bridge.so").
+        val strongKeywords = HardcodedSignals.strongRuntimeKeywords
+        val broadKeywords  = frameworkKeywords()
+        // Suspicious path context: root staging areas or anonymous mappings.
+        // We explicitly skip normal app library paths (/data/data/, /data/app/)
+        // unless the entry matches a strong keyword.
+        val rootStagingPrefixes = listOf(
+            "/data/adb/", "/debug_ramdisk/", "/sbin/.magisk/",
+            "/dev/magisk/", "/data/local/tmp/"
+        )
         try {
             File("/proc/self/maps").forEachLine { line ->
                 val lower = line.lowercase()
-                val matches = keywords.filter { lower.contains(it) }
-                if (matches.isNotEmpty() && systemPaths.none { line.contains(it) }) {
-                    found += "${matches.joinToString(",")} -> ${line.trim().take(120)}"
+                // Always skip trusted system/apex paths
+                if (systemPaths.any { line.contains(it) }) return@forEachLine
+                // Skip normal app library paths unless a strong keyword hits
+                val isNormalAppPath = lower.contains("/data/data/") || lower.contains("/data/app/")
+                val strongHits = strongKeywords.filter { lower.contains(it) }
+                if (strongHits.isNotEmpty()) {
+                    // Strong keyword match anywhere outside trusted paths → always flag
+                    found += "${strongHits.joinToString(",")} -> ${line.trim().take(120)}"
+                    return@forEachLine
+                }
+                // For broader keywords we require either a suspicious path prefix,
+                // an anonymous/deleted mapping, or an unlocked boot state.
+                if (isNormalAppPath) return@forEachLine
+                val broadHits = broadKeywords.filter { lower.contains(it) }
+                if (broadHits.isEmpty()) return@forEachLine
+                val isRootStagingPath  = rootStagingPrefixes.any { lower.contains(it) }
+                val isAnonymousMapping = lower.contains("memfd:") || lower.contains("(deleted)") || !lower.contains("/")
+                if (isRootStagingPath || isAnonymousMapping || !trustedLocked) {
+                    found += "${broadHits.joinToString(",")} -> ${line.trim().take(120)}"
                 }
             }
         } catch (_: Exception) {}
@@ -1289,20 +1317,28 @@ class RootDetector(private val context: Context) {
         if (kernelDate.after(newestRef.value)) {
             val deltaMs = kernelDate.time - newestRef.value.time
             val deltaDays = deltaMs / 86_400_000L
-            newerEvidence += "kernel_build=${formatDate(kernelDate)}"
-            newerEvidence += "newest_reference=${newestRef.key}:${formatDate(newestRef.value)}"
-            newerEvidence += "kernel_is_${deltaDays}d_newer_than_system"
-            newerEvidence += "indicates_aftermarket_kernel_flashed_post_OEM"
-            systemDates.forEach { (k, v) ->
-                if (kernelDate.after(v)) {
-                    val d = (kernelDate.time - v.time) / 86_400_000L
-                    newerEvidence += "$k=${formatDate(v)} (kernel +${d}d)"
+            // Grace period: OEM build pipelines and GKI security patches can legitimately
+            // produce a kernel that is a few weeks newer than the system image timestamp.
+            // We only flag when the kernel is significantly newer — aftermarket custom
+            // kernels are typically months ahead of the OEM image, not just days.
+            // Use a tighter threshold on unlocked devices since there the bar is lower.
+            val graceDays = if (bootLooksLockedAndNormal()) 21L else 14L
+            if (deltaDays > graceDays) {
+                newerEvidence += "kernel_build=${formatDate(kernelDate)}"
+                newerEvidence += "newest_reference=${newestRef.key}:${formatDate(newestRef.value)}"
+                newerEvidence += "kernel_is_${deltaDays}d_newer_than_system (threshold=${graceDays}d)"
+                newerEvidence += "indicates_aftermarket_kernel_flashed_post_OEM"
+                systemDates.forEach { (k, v) ->
+                    if (kernelDate.after(v)) {
+                        val d = (kernelDate.time - v.time) / 86_400_000L
+                        newerEvidence += "$k=${formatDate(v)} (kernel +${d}d)"
+                    }
                 }
-            }
-            patchDates.forEach { (k, v) ->
-                if (kernelDate.after(v)) {
-                    val d = (kernelDate.time - v.time) / 86_400_000L
-                    newerEvidence += "$k=${formatDate(v)} (kernel +${d}d)"
+                patchDates.forEach { (k, v) ->
+                    if (kernelDate.after(v)) {
+                        val d = (kernelDate.time - v.time) / 86_400_000L
+                        newerEvidence += "$k=${formatDate(v)} (kernel +${d}d)"
+                    }
                 }
             }
         }
@@ -1311,7 +1347,7 @@ class RootDetector(private val context: Context) {
             "Kernel Newer Than System / Security Patch",
             DetectionCategory.SYSTEM_PROPS,
             Severity.HIGH,
-            "Kernel build date is more recent than the system image and security patch — strong indicator of an aftermarket custom kernel flashed independently of the OEM update",
+            "Kernel build date is more than 21 days newer than the system image and security patch — strong indicator of an aftermarket custom kernel flashed independently of the OEM update",
             newerEvidence.isNotEmpty(),
             newerEvidence.joinToString("\n").ifEmpty { null }
         )
@@ -1724,11 +1760,18 @@ class RootDetector(private val context: Context) {
                 suspicious += "Build.FINGERPRINT differs from live system fingerprints"
             }
         }
-        if ((Build.TAGS ?: "").isNotBlank() && propTags.isNotBlank() && Build.TAGS != propTags) {
-            suspicious += "Build.TAGS differs from ro.build.tags"
-        }
-        if ((Build.TYPE ?: "").isNotBlank() && propType.isNotBlank() && Build.TYPE != propType) {
-            suspicious += "Build.TYPE differs from ro.build.type"
+        // Build.TAGS and Build.TYPE are baked into the Java framework at zygote fork time.
+        // On locked/trusted stock devices some OEMs legitimately ship different values in the
+        // live property system vs what the framework constant exposes (e.g. a vendor-added suffix
+        // on tags, or a build variant difference). Only flag these when the device is NOT
+        // trusted-locked — on an unlocked device a mismatch is a stronger resetprop signal.
+        if (!trustedLocked) {
+            if ((Build.TAGS ?: "").isNotBlank() && propTags.isNotBlank() && Build.TAGS != propTags) {
+                suspicious += "Build.TAGS differs from ro.build.tags"
+            }
+            if ((Build.TYPE ?: "").isNotBlank() && propType.isNotBlank() && Build.TYPE != propType) {
+                suspicious += "Build.TYPE differs from ro.build.type"
+            }
         }
         crossPartitionFingerprintMismatch(propFingerprint, systemFingerprint, trustedLocked)?.let { suspicious += it }
 
