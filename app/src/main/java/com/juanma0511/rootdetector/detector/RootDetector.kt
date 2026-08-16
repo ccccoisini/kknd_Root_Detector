@@ -2558,15 +2558,39 @@ class RootDetector(private val context: Context) {
 
     private fun checkKsuTempRootIntent(): List<DetectionItem> {
         val evidence = linkedSetOf<String>()
-        val tmpDir = File("/data/local/tmp")
+        val tmpBase = "/data/local/tmp"
         // KernelSU temp root artifacts — these files are staged during
         // active root deployment and are never present on stock devices.
-        val ksuMarkers = listOf("ksud", "temp_su", "ksu-helper", "ksu-payload")
+        // The directory is 0771 shell:shell so normal apps cannot listFiles(),
+        // but world-execute allows stat() on known paths directly.
+        val knownFiles = listOf(
+            "ksud", "ksud-aarch64-linux-android",
+            "ksu-helper", "ksu-payload",
+            "temp_su", "temp_su.sock"
+        )
+        // 1. Direct existence probe (works without dir read permission)
+        knownFiles.forEach { name ->
+            val f = File(tmpBase, name)
+            if (f.exists()) evidence += f.absolutePath
+        }
+        // 2. Broader scan if directory read is possible (e.g. debuggable builds,
+        // or app running with shell group)
+        val prefixMarkers = listOf("ksud", "temp_su", "ksu-helper", "ksu-payload")
         runCatching {
-            tmpDir.listFiles()?.forEach { child ->
+            File(tmpBase).listFiles()?.forEach { child ->
                 val name = child.name.lowercase()
-                if (ksuMarkers.any { name.startsWith(it) }) {
+                if (prefixMarkers.any { name.startsWith(it) }) {
                     evidence += child.absolutePath
+                }
+            }
+        }
+        // 3. Scan /proc/net/unix for KSU sockets (always readable, bypasses dir perms)
+        val socketMarkers = listOf("temp_su", "ksud", "ksu-helper")
+        runCatching {
+            File("/proc/net/unix").forEachLine { line ->
+                val lower = line.lowercase()
+                if (socketMarkers.any { lower.contains(it) }) {
+                    evidence += "unix_socket: ${line.trim().takeLast(120)}"
                 }
             }
         }
