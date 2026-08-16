@@ -78,7 +78,6 @@ class RootDetector(private val context: Context) {
             ::checkRootBinaries,
             ::checkWritablePaths,
             ::checkMagiskFiles,
-            ::checkOplusDirectories,
             ::checkFrida,
             ::checkEmulator,
             ::checkMountPoints,
@@ -343,36 +342,6 @@ class RootDetector(private val context: Context) {
             "magisk_files", "Magisk / KSU / APatch Files", DetectionCategory.MAGISK, Severity.HIGH,
             "Checks Magisk, KernelSU and APatch artifacts under /data/adb, /dev and ramdisk mirrors",
             regularFound.isNotEmpty(), regularFound.joinToString("\n").ifEmpty { null }
-        ))
-    }
-
-    private fun checkOplusDirectories(): List<DetectionItem> {
-        val found = linkedSetOf<String>()
-        val candidatePaths = linkedSetOf<String>()
-        candidatePaths += suPaths
-        candidatePaths += magiskPaths
-        dangerousBinaries.forEach { bin ->
-            binaryPaths.forEach { path ->
-                candidatePaths += "$path$bin"
-            }
-        }
-        candidatePaths.filter(::isOplusMarker).forEach { path ->
-            if (File(path).exists()) {
-                found += path
-            }
-        }
-        try {
-            File("/proc/mounts").forEachLine { line ->
-                val lower = line.lowercase()
-                if (isOplusMarker(lower)) {
-                    found += line.take(160)
-                }
-            }
-        } catch (_: Exception) {}
-        return listOf(det(
-            "oplus_dirs", "Oplus / OplusEx Directories", DetectionCategory.MOUNT_POINTS, Severity.WARNING,
-            "Directories and mount entries containing oplu or oplusex are treated as low severity unless direct root markers also appear",
-            found.isNotEmpty(), found.joinToString("\n").ifEmpty { null }
         ))
     }
 
