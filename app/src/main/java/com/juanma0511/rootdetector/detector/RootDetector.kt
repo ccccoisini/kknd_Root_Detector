@@ -131,6 +131,7 @@ class RootDetector(private val context: Context) {
             ::checkRecoveryArtifacts,
             ::checkInitDotD,
             ::checkDataLocalTmp,
+            ::checkKsuTempRootIntent,
             ::checkResetpropModifications,
             ::checkAppZygoteSepolicy,
             ::checkContextValidityOracle,
@@ -2550,6 +2551,31 @@ class RootDetector(private val context: Context) {
             "data_local_tmp", "Suspicious Files in /data/local/tmp",
             DetectionCategory.SU_BINARIES, Severity.HIGH,
             "Executable or root-named files in world-writable temp dirs — common staging ground for root tools and exploits",
+            evidence.isNotEmpty(), evidence.joinToString("\n").ifEmpty { null }
+        ))
+    }
+
+
+    private fun checkKsuTempRootIntent(): List<DetectionItem> {
+        val evidence = linkedSetOf<String>()
+        val tmpDir = File("/data/local/tmp")
+        // KernelSU temp root artifacts — these files are staged during
+        // active root deployment and are never present on stock devices.
+        val ksuMarkers = listOf("ksud", "temp_su", "ksu-helper", "ksu-payload")
+        runCatching {
+            tmpDir.listFiles()?.forEach { child ->
+                val name = child.name.lowercase()
+                if (ksuMarkers.any { name.startsWith(it) }) {
+                    evidence += child.absolutePath
+                }
+            }
+        }
+        return listOf(det(
+            "ksu_temp_root_intent",
+            "KernelSU Temp Root Intent",
+            DetectionCategory.SU_BINARIES,
+            Severity.HIGH,
+            "KernelSU staging artifacts (ksud, temp_su, ksu-helper, ksu-payload) found in /data/local/tmp — active root deployment in progress",
             evidence.isNotEmpty(), evidence.joinToString("\n").ifEmpty { null }
         ))
     }
