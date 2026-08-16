@@ -338,7 +338,9 @@ static void detectDataLocalArtifacts() {
     };
     const char* suspicious[] = {
         "su", "magisk", "frida", "gdb", "strace", "ltrace",
-        "busybox", "ksud", "apd", "resetprop", nullptr
+        "busybox", "ksud", "apd", "resetprop",
+        "ksud-aarch64-linux-android", "ksu-helper", "ksu-payload",
+        "temp_su", "temp_su.sock", nullptr
     };
     std::vector<std::string> found;
     for (int i = 0; tmp_dirs[i]; i++) {

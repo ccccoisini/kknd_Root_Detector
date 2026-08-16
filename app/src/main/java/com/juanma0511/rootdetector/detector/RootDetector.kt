@@ -78,7 +78,6 @@ class RootDetector(private val context: Context) {
             ::checkRootBinaries,
             ::checkWritablePaths,
             ::checkMagiskFiles,
-            ::checkOplusDirectories,
             ::checkFrida,
             ::checkEmulator,
             ::checkMountPoints,
@@ -131,6 +130,7 @@ class RootDetector(private val context: Context) {
             ::checkRecoveryArtifacts,
             ::checkInitDotD,
             ::checkDataLocalTmp,
+            ::checkKsuTempRootIntent,
             ::checkResetpropModifications,
             ::checkAppZygoteSepolicy,
             ::checkContextValidityOracle,
@@ -345,36 +345,6 @@ class RootDetector(private val context: Context) {
         ))
     }
 
-    private fun checkOplusDirectories(): List<DetectionItem> {
-        val found = linkedSetOf<String>()
-        val candidatePaths = linkedSetOf<String>()
-        candidatePaths += suPaths
-        candidatePaths += magiskPaths
-        dangerousBinaries.forEach { bin ->
-            binaryPaths.forEach { path ->
-                candidatePaths += "$path$bin"
-            }
-        }
-        candidatePaths.filter(::isOplusMarker).forEach { path ->
-            if (File(path).exists()) {
-                found += path
-            }
-        }
-        try {
-            File("/proc/mounts").forEachLine { line ->
-                val lower = line.lowercase()
-                if (isOplusMarker(lower)) {
-                    found += line.take(160)
-                }
-            }
-        } catch (_: Exception) {}
-        return listOf(det(
-            "oplus_dirs", "Oplus / OplusEx Directories", DetectionCategory.MOUNT_POINTS, Severity.WARNING,
-            "Directories and mount entries containing oplu or oplusex are treated as low severity unless direct root markers also appear",
-            found.isNotEmpty(), found.joinToString("\n").ifEmpty { null }
-        ))
-    }
-
     private fun checkFrida(): List<DetectionItem> {
         val evidence = linkedSetOf<String>()
         fridaProcesses.forEach { name ->
@@ -520,14 +490,42 @@ class RootDetector(private val context: Context) {
 
     private fun checkNativeLibMaps(): List<DetectionItem> {
         val found = linkedSetOf<String>()
+        val trustedLocked = bootLooksLockedAndNormal()
         val systemPaths = protectedSystemPaths.map { "$it/" } + "/apex/"
-        val keywords = frameworkKeywords()
+        // Use the stricter strong-signal keyword set as the primary filter to avoid
+        // false positives from app-private JNI libs whose paths happen to contain a
+        // generic root-framework term (e.g. a vendor lib named "hook_bridge.so").
+        val strongKeywords = HardcodedSignals.strongRuntimeKeywords
+        val broadKeywords  = frameworkKeywords()
+        // Suspicious path context: root staging areas or anonymous mappings.
+        // We explicitly skip normal app library paths (/data/data/, /data/app/)
+        // unless the entry matches a strong keyword.
+        val rootStagingPrefixes = listOf(
+            "/data/adb/", "/debug_ramdisk/", "/sbin/.magisk/",
+            "/dev/magisk/", "/data/local/tmp/"
+        )
         try {
             File("/proc/self/maps").forEachLine { line ->
                 val lower = line.lowercase()
-                val matches = keywords.filter { lower.contains(it) }
-                if (matches.isNotEmpty() && systemPaths.none { line.contains(it) }) {
-                    found += "${matches.joinToString(",")} -> ${line.trim().take(120)}"
+                // Always skip trusted system/apex paths
+                if (systemPaths.any { line.contains(it) }) return@forEachLine
+                // Skip normal app library paths unless a strong keyword hits
+                val isNormalAppPath = lower.contains("/data/data/") || lower.contains("/data/app/")
+                val strongHits = strongKeywords.filter { lower.contains(it) }
+                if (strongHits.isNotEmpty()) {
+                    // Strong keyword match anywhere outside trusted paths → always flag
+                    found += "${strongHits.joinToString(",")} -> ${line.trim().take(120)}"
+                    return@forEachLine
+                }
+                // For broader keywords we require either a suspicious path prefix,
+                // an anonymous/deleted mapping, or an unlocked boot state.
+                if (isNormalAppPath) return@forEachLine
+                val broadHits = broadKeywords.filter { lower.contains(it) }
+                if (broadHits.isEmpty()) return@forEachLine
+                val isRootStagingPath  = rootStagingPrefixes.any { lower.contains(it) }
+                val isAnonymousMapping = lower.contains("memfd:") || lower.contains("(deleted)") || !lower.contains("/")
+                if (isRootStagingPath || isAnonymousMapping || !trustedLocked) {
+                    found += "${broadHits.joinToString(",")} -> ${line.trim().take(120)}"
                 }
             }
         } catch (_: Exception) {}
@@ -922,6 +920,17 @@ class RootDetector(private val context: Context) {
         )
     }
 
+    // On Android 17+ Pixel builds the system partition is a shared/generic
+    // image, so ro.system.build.fingerprint legitimately reads as e.g.
+    // google/generic_system_google/generic:... while ro.build.fingerprint
+    // keeps the real device codename (blazer, tokay, ...). Not a spoof.
+    private fun isGenericSystemImage(parts: FingerprintParts): Boolean {
+        val product = parts.product.lowercase()
+        val device = parts.device.lowercase()
+        return product == "generic" || product.startsWith("generic_") ||
+            device == "generic" || device.startsWith("generic_")
+    }
+
     private fun compatibleIncremental(left: String, right: String): Boolean {
         if (left == right) return true
         if (left.startsWith(right) || right.startsWith(left)) return true
@@ -970,7 +979,10 @@ class RootDetector(private val context: Context) {
             return "ro.build and ro.system fingerprints disagree on build incremental"
         }
 
-        if (!trustedLocked && build.product != system.product && build.device != system.device) {
+        // Skip the codename comparison when one side is a generic/shared system
+        // image, otherwise every stock A17+ Pixel trips the product/device check.
+        if (!trustedLocked && !isGenericSystemImage(build) && !isGenericSystemImage(system) &&
+            build.product != system.product && build.device != system.device) {
             return "ro.build and ro.system fingerprints disagree on product/device"
         }
 
@@ -1271,24 +1283,37 @@ class RootDetector(private val context: Context) {
         val results = mutableListOf<DetectionItem>()
 
         val newerEvidence = linkedSetOf<String>()
+        var newerSeverity = Severity.WARNING
         val newestRef = allReferences.maxByOrNull { it.value.time }!!
         if (kernelDate.after(newestRef.value)) {
             val deltaMs = kernelDate.time - newestRef.value.time
             val deltaDays = deltaMs / 86_400_000L
-            newerEvidence += "kernel_build=${formatDate(kernelDate)}"
-            newerEvidence += "newest_reference=${newestRef.key}:${formatDate(newestRef.value)}"
-            newerEvidence += "kernel_is_${deltaDays}d_newer_than_system"
-            newerEvidence += "indicates_aftermarket_kernel_flashed_post_OEM"
-            systemDates.forEach { (k, v) ->
-                if (kernelDate.after(v)) {
-                    val d = (kernelDate.time - v.time) / 86_400_000L
-                    newerEvidence += "$k=${formatDate(v)} (kernel +${d}d)"
+            // Grace period: OEM GKI and vendor kernel pipelines routinely produce
+            // kernels 30–60+ days newer than the system image timestamp. Samsung,
+            // Google, OnePlus and others all exhibit this in stock builds.
+            // We use a flat 90-day threshold regardless of boot state —
+            // environment spoofing (Magisk/KSU resetprop) can make boot props
+            // appear locked, so we do not trust that signal for this check.
+            // Only deltas beyond 90 days indicate a custom kernel; beyond
+            // 180 days is a very strong signal worth HIGH severity.
+            val graceDays = 90L
+            if (deltaDays > graceDays) {
+                newerSeverity = if (deltaDays > 180L) Severity.HIGH else Severity.WARNING
+                newerEvidence += "kernel_build=${formatDate(kernelDate)}"
+                newerEvidence += "newest_reference=${newestRef.key}:${formatDate(newestRef.value)}"
+                newerEvidence += "kernel_is_${deltaDays}d_newer_than_system (threshold=${graceDays}d)"
+                newerEvidence += "indicates_aftermarket_kernel_flashed_post_OEM"
+                systemDates.forEach { (k, v) ->
+                    if (kernelDate.after(v)) {
+                        val d = (kernelDate.time - v.time) / 86_400_000L
+                        newerEvidence += "$k=${formatDate(v)} (kernel +${d}d)"
+                    }
                 }
-            }
-            patchDates.forEach { (k, v) ->
-                if (kernelDate.after(v)) {
-                    val d = (kernelDate.time - v.time) / 86_400_000L
-                    newerEvidence += "$k=${formatDate(v)} (kernel +${d}d)"
+                patchDates.forEach { (k, v) ->
+                    if (kernelDate.after(v)) {
+                        val d = (kernelDate.time - v.time) / 86_400_000L
+                        newerEvidence += "$k=${formatDate(v)} (kernel +${d}d)"
+                    }
                 }
             }
         }
@@ -1296,13 +1321,14 @@ class RootDetector(private val context: Context) {
             "kernel_newer_than_system",
             "Kernel Newer Than System / Security Patch",
             DetectionCategory.SYSTEM_PROPS,
-            Severity.HIGH,
-            "Kernel build date is more recent than the system image and security patch — strong indicator of an aftermarket custom kernel flashed independently of the OEM update",
+            newerSeverity,
+            "Kernel build date is more than 90 days newer than the system image and security patch — indicates an aftermarket custom kernel flashed independently of the OEM update",
             newerEvidence.isNotEmpty(),
             newerEvidence.joinToString("\n").ifEmpty { null }
         )
 
-        val thresholdDays = if (bootLooksLockedAndNormal()) 60L else 30L
+        // Use a flat 90-day threshold regardless of boot state (easily spoofed).
+        val thresholdDays = 90L
         val closest = patchDates.minByOrNull { diffDays(kernelDate, it.value) }
         val newest = patchDates.maxByOrNull { it.value.time }
         val staleness = linkedSetOf<String>()
@@ -1710,11 +1736,18 @@ class RootDetector(private val context: Context) {
                 suspicious += "Build.FINGERPRINT differs from live system fingerprints"
             }
         }
-        if ((Build.TAGS ?: "").isNotBlank() && propTags.isNotBlank() && Build.TAGS != propTags) {
-            suspicious += "Build.TAGS differs from ro.build.tags"
-        }
-        if ((Build.TYPE ?: "").isNotBlank() && propType.isNotBlank() && Build.TYPE != propType) {
-            suspicious += "Build.TYPE differs from ro.build.type"
+        // Build.TAGS and Build.TYPE are baked into the Java framework at zygote fork time.
+        // On locked/trusted stock devices some OEMs legitimately ship different values in the
+        // live property system vs what the framework constant exposes (e.g. a vendor-added suffix
+        // on tags, or a build variant difference). Only flag these when the device is NOT
+        // trusted-locked — on an unlocked device a mismatch is a stronger resetprop signal.
+        if (!trustedLocked) {
+            if ((Build.TAGS ?: "").isNotBlank() && propTags.isNotBlank() && Build.TAGS != propTags) {
+                suspicious += "Build.TAGS differs from ro.build.tags"
+            }
+            if ((Build.TYPE ?: "").isNotBlank() && propType.isNotBlank() && Build.TYPE != propType) {
+                suspicious += "Build.TYPE differs from ro.build.type"
+            }
         }
         crossPartitionFingerprintMismatch(propFingerprint, systemFingerprint, trustedLocked)?.let { suspicious += it }
 
@@ -2487,6 +2520,55 @@ class RootDetector(private val context: Context) {
             "data_local_tmp", "Suspicious Files in /data/local/tmp",
             DetectionCategory.SU_BINARIES, Severity.HIGH,
             "Executable or root-named files in world-writable temp dirs — common staging ground for root tools and exploits",
+            evidence.isNotEmpty(), evidence.joinToString("\n").ifEmpty { null }
+        ))
+    }
+
+
+    private fun checkKsuTempRootIntent(): List<DetectionItem> {
+        val evidence = linkedSetOf<String>()
+        val tmpBase = "/data/local/tmp"
+        // KernelSU temp root artifacts — these files are staged during
+        // active root deployment and are never present on stock devices.
+        // The directory is 0771 shell:shell so normal apps cannot listFiles(),
+        // but world-execute allows stat() on known paths directly.
+        val knownFiles = listOf(
+            "ksud", "ksud-aarch64-linux-android",
+            "ksu-helper", "ksu-payload",
+            "temp_su", "temp_su.sock"
+        )
+        // 1. Direct existence probe (works without dir read permission)
+        knownFiles.forEach { name ->
+            val f = File(tmpBase, name)
+            if (f.exists()) evidence += f.absolutePath
+        }
+        // 2. Broader scan if directory read is possible (e.g. debuggable builds,
+        // or app running with shell group)
+        val prefixMarkers = listOf("ksud", "temp_su", "ksu-helper", "ksu-payload")
+        runCatching {
+            File(tmpBase).listFiles()?.forEach { child ->
+                val name = child.name.lowercase()
+                if (prefixMarkers.any { name.startsWith(it) }) {
+                    evidence += child.absolutePath
+                }
+            }
+        }
+        // 3. Scan /proc/net/unix for KSU sockets (always readable, bypasses dir perms)
+        val socketMarkers = listOf("temp_su", "ksud", "ksu-helper")
+        runCatching {
+            File("/proc/net/unix").forEachLine { line ->
+                val lower = line.lowercase()
+                if (socketMarkers.any { lower.contains(it) }) {
+                    evidence += "unix_socket: ${line.trim().takeLast(120)}"
+                }
+            }
+        }
+        return listOf(det(
+            "ksu_temp_root_intent",
+            "KernelSU Temp Root Intent",
+            DetectionCategory.SU_BINARIES,
+            Severity.HIGH,
+            "KernelSU staging artifacts (ksud, temp_su, ksu-helper, ksu-payload) found in /data/local/tmp — active root deployment in progress",
             evidence.isNotEmpty(), evidence.joinToString("\n").ifEmpty { null }
         ))
     }

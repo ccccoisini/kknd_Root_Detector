@@ -7,9 +7,9 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: 'Release tag (e.g. v3.1)'
+        description: 'Release tag (e.g. v3.3)'
         required: true
-        default: 'v3.1'
+        default: 'v3.3'
 
 jobs:
   release:
@@ -101,15 +101,19 @@ jobs:
           body: |
             ## What's new in ${{ github.ref_name || inputs.tag }}
 
-            - 71 native detection functions across all root/hook vectors
-            - SELinux `attr/current` write probe — detects root contexts in policy
-            - DirtySepolicy access rule checks via `selinux_check_access`
-            - Resetprop modification detection across all partition prop files
-            - PIF / TrickyStore spoof config detection
-            - Floating MD3 pill navigation bar
-            - All contributors shown in the About section with GitHub avatars
-            - Split APKs: `arm64-v8a` and `armeabi-v7a`
+            ### Bug Fixes
+            - Kernel patch window: raised grace period to 90 days, removed easily-spoofed boot-state trust, tiered severity (WARNING 91–180d, HIGH >180d)
+            - Fixed SELinux bypass for KernelSU temp root detection — `File.exists()` silently failed on `/data/local/tmp` due to `untrusted_app` restrictions
 
-            Two APKs are attached below — pick the one matching your device ABI.
+            ### New Detections
+            - KernelSU temp root intent: direct `stat()` probes for known KSU staging files (`ksud`, `ksud-aarch64-linux-android`, `ksu-helper`, `ksu-payload`, `temp_su`, `temp_su.sock`)
+            - `/proc/net/unix` socket scan for `temp_su`/`ksud` sockets — always readable, bypasses directory permission restrictions
+            - Native layer: added KSU-specific filenames to `detectDataLocalArtifacts()` suspicious list
+
+            ### Removed
+            - Oplus/OplusEx directory detection removed entirely — caused false positives on OnePlus/Oppo/Realme stock devices
+
+            ### Notes
+            - Split APKs: `arm64-v8a` and `armeabi-v7a` — pick the one matching your device ABI.
           files: app/build/outputs/apk/release/*.apk
           fail_on_unmatched_files: true

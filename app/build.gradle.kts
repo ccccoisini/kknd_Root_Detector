@@ -9,13 +9,14 @@ import org.jetbrains.kotlin.gradle.dsl.JvmTarget
 android {
     namespace = "com.juanma0511.rootdetector"
     compileSdk = 36
+    ndkVersion = "28.0.12433566"
 
     defaultConfig {
         applicationId = "com.juanma0511.rootdetector"
         minSdk = 26
         targetSdk = 36
-        versionCode = 5
-        versionName = "3.2"
+        versionCode = 6
+        versionName = "3.3"
         buildToolsVersion = "36.1.0"
 
         externalNativeBuild {
