@@ -1313,17 +1313,22 @@ class RootDetector(private val context: Context) {
         val results = mutableListOf<DetectionItem>()
 
         val newerEvidence = linkedSetOf<String>()
+        var newerSeverity = Severity.WARNING
         val newestRef = allReferences.maxByOrNull { it.value.time }!!
         if (kernelDate.after(newestRef.value)) {
             val deltaMs = kernelDate.time - newestRef.value.time
             val deltaDays = deltaMs / 86_400_000L
-            // Grace period: OEM build pipelines and GKI security patches can legitimately
-            // produce a kernel that is a few weeks newer than the system image timestamp.
-            // We only flag when the kernel is significantly newer — aftermarket custom
-            // kernels are typically months ahead of the OEM image, not just days.
-            // Use a tighter threshold on unlocked devices since there the bar is lower.
-            val graceDays = if (bootLooksLockedAndNormal()) 21L else 14L
+            // Grace period: OEM GKI and vendor kernel pipelines routinely produce
+            // kernels 30–60+ days newer than the system image timestamp. Samsung,
+            // Google, OnePlus and others all exhibit this in stock builds.
+            // We use a flat 90-day threshold regardless of boot state —
+            // environment spoofing (Magisk/KSU resetprop) can make boot props
+            // appear locked, so we do not trust that signal for this check.
+            // Only deltas beyond 90 days indicate a custom kernel; beyond
+            // 180 days is a very strong signal worth HIGH severity.
+            val graceDays = 90L
             if (deltaDays > graceDays) {
+                newerSeverity = if (deltaDays > 180L) Severity.HIGH else Severity.WARNING
                 newerEvidence += "kernel_build=${formatDate(kernelDate)}"
                 newerEvidence += "newest_reference=${newestRef.key}:${formatDate(newestRef.value)}"
                 newerEvidence += "kernel_is_${deltaDays}d_newer_than_system (threshold=${graceDays}d)"
@@ -1346,13 +1351,14 @@ class RootDetector(private val context: Context) {
             "kernel_newer_than_system",
             "Kernel Newer Than System / Security Patch",
             DetectionCategory.SYSTEM_PROPS,
-            Severity.HIGH,
-            "Kernel build date is more than 21 days newer than the system image and security patch — strong indicator of an aftermarket custom kernel flashed independently of the OEM update",
+            newerSeverity,
+            "Kernel build date is more than 90 days newer than the system image and security patch — indicates an aftermarket custom kernel flashed independently of the OEM update",
             newerEvidence.isNotEmpty(),
             newerEvidence.joinToString("\n").ifEmpty { null }
         )
 
-        val thresholdDays = if (bootLooksLockedAndNormal()) 60L else 30L
+        // Use a flat 90-day threshold regardless of boot state (easily spoofed).
+        val thresholdDays = 90L
         val closest = patchDates.minByOrNull { diffDays(kernelDate, it.value) }
         val newest = patchDates.maxByOrNull { it.value.time }
         val staleness = linkedSetOf<String>()
